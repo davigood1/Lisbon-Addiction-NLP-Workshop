@@ -1,0 +1,710 @@
+```{r Load libraries}
+#install.packages("pacman")
+library(pacman)
+p_load(tidyverse, tidylog, purrr, forcats, colorspace, gtsummary, flextable, tictoc) #Basic
+p_load(textrecipes, tidytext, wordcloud) #Text processing helpers
+p_load(tidymodels, parsnip, discrim, naivebayes, ranger, xgboost, kknn, keras, workflowsets, themis, stacks, vip) #Models
+p_load(parallel, future, doFuture) # Parralel processing
+p_load_gh("AlbertRapp/tidychatmodels") #Large language models
+
+#Set-up API keys
+p_load(usethis)
+#usethis::edit_r_environ()
+
+theme_set(theme_minimal()) #For ggplots
+
+set.seed(100) #For reproducibility
+```
+
+```{r Load data}
+df <- readRDS("Data/2020 Mortality Data_clean.rds")
+
+df <- df %>% mutate(across(c(13:34), ~as.factor(.))) #Make factors
+###MOST IMPORTANT PIECE!!!
+###MOST IMPORTANT PIECE!!!
+###MOST IMPORTANT PIECE!!!
+###MOST IMPORTANT PIECE!!!
+df <- df %>% mutate(across(c(13:34), ~fct_rev(.))) #Reverse level for proper testing results. 
+
+df$Outcome <- df$`Any Opioids`
+```
+
+```{r EDA - Basic}
+#Counts by county
+df %>% 
+  group_by(County) %>% 
+  summarise(n = n()) %>%
+  mutate(Percentage = round(n / sum(n)*100,1)) %>% 
+  arrange(desc(n))
+```
+
+```{r}
+#5-number summary by character
+df %>% 
+  summarize( Min = min(nchar(text)),
+             Q1 = quantile(nchar(text), .25),
+             Mean = mean(nchar(text)), 
+             Median = median(nchar(text)), 
+             Q3 = quantile(nchar(text), .75),
+             Max = max(nchar(text))
+             )
+```
+
+```{r}
+#5-number summary by word
+df %>% 
+  mutate(nword = str_count(text, '\\w+')) %>%
+  summarize( Min = min(nword),
+             Q1 = quantile(nword, .25),
+             Mean = mean(nword), 
+             Median = median(nword), 
+             Q3 = quantile(nword, .75),
+             Max = max(nword)
+             )
+```
+
+```{r}
+# Co-occurence table
+df.cross <- as.data.frame(
+  crossprod(
+    as.matrix(df[, c(
+      "Heroin", "Fentanyl", "Prescription.opioids",
+      "Methamphetamine", "Cocaine", "Benzodiazepines", "Alcohol", "Others"
+    )] == 1)
+  )
+)
+
+flextable(df.cross %>% rownames_to_column()) %>%
+  set_caption(caption = "Supplementary Table. Co-occurrence of substances involved in overdose deaths") %>%
+  autofit() %>%
+  theme_zebra(odd_header = "transparent", even_header = "transparent")
+```
+
+```{r EDA - Plots}
+texts <- as_tibble(df) %>% 
+  mutate(document = row_number()) %>% 
+  select(text)
+
+tidy_texts <- texts %>%
+  unnest_tokens(word, text) %>%
+  group_by(word) %>%
+  filter(n() > 10) %>%
+  ungroup()
+
+#Remove stop words
+stopword <- as_tibble(stopwords::stopwords("en")) 
+stopword <- rename(stopword, word=value)
+tb <- anti_join(tidy_texts, stopword, by = 'word')
+
+#Frequencies
+tb %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 2000) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col() +
+  xlab(NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  coord_flip() +
+  theme_classic(base_size = 12) +
+  labs(title="Word frequency", subtitle="n > 100")+
+  theme(plot.title = element_text(lineheight=.8, face="bold")) +
+  scale_fill_brewer() 
+```
+
+```{r}
+#Word cloud
+tb %>%
+  count(word) %>%
+  with(wordcloud(word, n, max.words = 30))
+```
+
+```{r}
+df.long <- df %>% pivot_longer(
+  cols = 13:34
+)
+
+ggplot(data = df.long %>% filter(value == 1) %>% filter(!name %in% c("Dextromethorphan", "Opioid", "Xanax", "Others")), 
+       aes(x = reorder(name, name, function(x)-length(x)), fill = name)) + 
+  geom_bar(stat = "count", position = position_dodge(), fill = "blue") +
+  geom_text(stat='count', aes(label=..count..),vjust=-0.5) +
+  scale_y_continuous(limits = c(0, 6500)) +
+  labs(x = "Substance", y= "Count") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, size = 14, hjust = 1),
+                          legend.position = "none")
+```
+
+```{r}
+#How many are all negative
+ggplot(data = df %>% group_by(`Number of substances`) %>% count() %>% uncount(n),
+       aes(x = as.factor(`Number of substances`), fill = `Number of substances`)) + 
+  geom_bar(stat = "count", position = position_dodge(), fill = "maroon") +
+  geom_text(stat='count', aes(label=..count..),vjust=-0.5) +
+  scale_y_continuous(limits = c(0, 27000), breaks = c(0,5000, 10000, 15000, 20000, 25000)) +
+  labs(x = "Number of Substance(s) Classified", y= "Count") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 0, size = 14, hjust = 0.5),
+                          legend.position = "none")
+```
+
+
+```{r Train-test split}
+#Create training/testing dataset
+data_split <- df %>% 
+  initial_split(prop = 0.8,
+                strata = Outcome)
+
+# Create dataframes for the two splits:
+training <- data_split %>% 
+  training( )
+
+testing <- data_split %>% 
+  testing( )
+
+#Cross validation
+cv_folds <- training %>% vfold_cv(v = 10, strata = Outcome)
+```
+
+```{r Feature extraction}
+df.dtm <- data.frame(Outcome = 0, 
+                        text = c("COMBINED FENTANYL AND METHAMPHETAMINE TOXICITY. FENTANYL OVERDOSE.",
+                                 "COCAINE, FENTANYL AND HEROIN TOXICITY",
+                                 "COVID VIRUS INFECTION"))
+
+#TF
+rec <- recipe(Outcome ~ text, data = df.dtm %>% select(Outcome, text)) %>%
+  #update_role(Outcome, new_role = "outcome") %>%
+  #update_role(text, new_role = "predictor") %>%
+  step_tokenize(text,
+                options = list(lowercase = F,
+                               strip_punct = TRUE)) %>%
+  step_tokenfilter(text, min_times = 0, max_times = Inf) %>%
+  step_tf(text)
+
+prep <- prep(rec)
+juiced <- juice(prep) %>% rename_all(~str_replace_all(.,"tf_text_",""))
+juiced 
+```
+
+```{r}
+#TF-IDF
+rec <- recipe(Outcome ~ text, data = df.dtm %>% select(Outcome, text)) %>%
+  #update_role(Outcome, new_role = "outcome") %>%
+  #update_role(text, new_role = "predictor") %>%
+  step_tokenize(text,
+                options = list(lowercase = F,
+                               strip_punct = TRUE)) %>%
+  step_tokenfilter(text, min_times = 0, max_times = Inf) %>%
+  step_tfidf(text)
+
+prep <- prep(rec)
+juiced <- juice(prep) %>% rename_all(~str_replace_all(.,"tfidf_text_",""))
+juiced 
+```
+
+```{r}
+#Sequence one hot
+rec <- recipe(Outcome ~ text, data = df.dtm %>% select(Outcome, text)) %>%
+  #update_role(Outcome, new_role = "outcome") %>%
+  #update_role(text, new_role = "predictor") %>%
+  step_tokenize(text,
+                options = list(lowercase = F,
+                               strip_punct = TRUE)) %>%
+  step_tokenfilter(text, min_times = 0, max_times = Inf) %>%
+  step_sequence_onehot(text, sequence_length = 7, padding = "post")
+
+prep <- prep(rec)
+View(tidy(prep, number = 3))
+juiced <- juice(prep) %>% rename_all(~str_replace_all(.,"tfidf_text_",""))
+juiced
+```
+
+```{r}
+glove6b <- textdata::embedding_glove6b(dimensions = 100)
+
+#Embeddings
+rec <- recipe(Outcome ~ text, data = df.dtm %>% select(Outcome, text)) %>%
+  #update_role(Outcome, new_role = "outcome") %>%
+  #update_role(text, new_role = "predictor") %>%
+  step_tokenize(text,
+                options = list(lowercase = T,
+                               strip_punct = TRUE)) %>%
+  step_tokenfilter(text, min_times = 0, max_times = Inf) %>%
+  step_sequence_onehot(text, sequence_length = 7, padding = "post")
+
+prep <- prep(rec)
+tidy(prep, number = 3)
+juiced <- juice(prep) %>% rename_all(~str_replace_all(.,"tfidf_text_",""))
+
+glove6b_matrix <- tidy(prep, 3) %>%
+  select(token) %>%
+  left_join(glove6b, by = "token")
+```
+
+```{r Set up recipe}
+rec <- recipe(Outcome ~ text, data = training %>% select(Outcome, text)) %>%
+  #update_role(Outcome, new_role = "outcome") %>%
+  #update_role(text, new_role = "predictor") %>%
+  step_tokenize(text,
+                options = list(lowercase = F,
+                               strip_punct = TRUE)) %>%
+  step_tokenfilter(text, min_times = 1, max_times = Inf, max_tokens = Inf) %>%
+  step_tfidf(text)
+
+prep <- prep(rec)
+juiced <- juice(prep)
+```
+
+```{r Set up models}
+#Set-up specs for classifiers
+log_spec <- logistic_reg() %>% 
+  set_mode("classification") %>%
+    set_engine(engine = "glm")
+
+
+nb_spec <- naive_Bayes() %>% 
+  set_mode("classification") %>% 
+  set_engine("naivebayes")
+
+rf_spec <- rand_forest(min_n = tune(), trees = tune(), mtry  = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+  
+
+xgb_spec <- boost_tree(trees = tune(), tree_depth = tune(), mtry  = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+knn_spec <- nearest_neighbor(neighbors = tune(), weight_func = tune()) %>% 
+  set_mode("classification") %>%
+  set_engine("kknn")
+
+svm_spec <- svm_linear(cost = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kernlab")
+
+nnet_spec <-  mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("nnet")
+```
+
+```{r Set-up hyperparameter grid}
+grid_ctrl <-
+   control_grid(
+      save_pred = TRUE,
+      parallel_over = "everything",
+      save_workflow = FALSE
+   )
+
+# Detect the number of cores available
+parallel::detectCores(logical = FALSE) # How many cores available
+
+# Set up the parallel backend using future
+plan(multicore, workers = 8) # Use 8 cores for parallel processing
+registerDoFuture()
+```
+
+```{r Set-up workflow}
+wflw_set <- workflow_set(
+  preproc = list(rec), 
+  models = list(Logistic.regression = log_spec, 
+                Naive.Bayes = nb_spec, 
+                Random.forest = rf_spec, 
+                XGBoost = xgb_spec, 
+                KNN = knn_spec, 
+                SVM = svm_spec, 
+                MLP = nnet_spec))
+
+```
+
+```{r Start training}
+#Cross validation
+cv_folds <- training %>% vfold_cv(v = 5, strata = Outcome)
+
+#Train
+tic()
+grid_results <- wflw_set %>%
+  workflow_map(
+      seed = 100,
+      resamples = cv_folds,
+      grid = 10,
+      control = grid_ctrl,
+      metrics = metric_set(recall, precision, f_meas, accuracy, 
+                           kap, roc_auc, sens, spec, ppv, npv),
+      verbose = T
+      )
+toc()
+
+saveRDS(grid_results, "Output/grid_results.rds")
+```
+
+```{r Training Plots}
+#grid_results <- readRDS("Output/grid_results.rds")
+
+grid_results <- grid_results[-7,]
+
+#Plot all results
+grid_results %>% autoplot()
+
+#Plot best results
+grid_results %>% autoplot(select_best = T)
+
+#ROC curve
+grid_results %>% 
+  collect_predictions() %>%		
+  group_by(model) %>%
+	roc_curve(truth = Outcome, estimate = .pred_1) %>%
+  	autoplot()
+
+#PR curve
+grid_results %>% 
+  collect_predictions() %>%	
+  group_by(model) %>%
+	pr_curve(truth = Outcome, estimate = .pred_1) %>%
+  	autoplot()
+
+```
+
+```{r Training tables}
+#All results long table
+tbl.train.results.all <- grid_results %>% 
+  collect_metrics()
+
+#All results wide table
+tbl.train.results.all.w <- grid_results %>% 
+  collect_metrics() %>%
+  pivot_wider(
+    id_cols = c(.config, model),
+    names_from = .metric,
+    values_from = mean
+    ) %>%
+  arrange(desc(f_meas))
+tbl.train.results.all.w
+
+#Best results long table
+tbl.train.results.best <- grid_results %>% 
+  rank_results(rank_metric = "f_meas", 
+               select_best = TRUE) 
+tbl.train.results.best
+
+#Best results wide table
+tbl.train.results.best.w <- grid_results %>% 
+  rank_results(rank_metric = "f_meas", 
+               select_best = TRUE) %>%
+   pivot_wider(
+    id_cols = c(.config, model),
+    names_from = .metric,
+    values_from = mean
+    ) 
+tbl.train.results.best.w
+```
+
+```{r Testing}
+best.workflow <- tbl.train.results.best$wflow_id[1]
+best.paramaters <- grid_results %>% 
+                       extract_workflow_set_result(tbl.train.results.best$wflow_id[1]) %>%
+                       select_best(metric = "f_meas")
+
+tic()
+test_results <- grid_results %>%
+   extract_workflow(best.workflow) %>% 
+   finalize_workflow(best.paramaters) %>% 
+   last_fit(split = data_split, 
+            metrics = metric_set(f_meas, accuracy, kap, roc_auc, sens, spec, ppv, npv)) 
+toc()
+
+saveRDS(test_results, "Output/test_results.rds")
+```
+
+```{r Testing results}
+#test_results <- readRDS("Output/test_results.rds")
+
+#Testing results table long
+tbl.test <- test_results %>% collect_metrics()
+tbl.test
+
+#Testing results table wide
+tbl.test.w <- test_results %>% 
+  collect_metrics() %>%
+  pivot_wider(
+    id_cols = .config,
+    names_from = .metric,
+    values_from = .estimate
+)
+tbl.test.w
+
+#ROC curve
+test_results %>% 
+  collect_predictions() %>% 	
+  roc_curve(truth = Outcome, estimate = .pred_1) %>%
+  autoplot()
+
+#PR curve
+test_results %>% 
+  collect_predictions() %>% 	
+  pr_curve(truth = Outcome, estimate = .pred_1) %>%
+  autoplot()
+```
+
+```{r Confusion matrix}
+test_cm_table <- test_results %>% 
+  collect_predictions() %>% 
+  conf_mat(Outcome, .pred_class) 
+test_cm_table
+
+test_cm_plot <- test_results %>% 
+  collect_predictions() %>% 
+  conf_mat(Outcome, .pred_class)  %>%
+  autoplot(type = "heatmap") +
+  labs(
+    title = "Confusion matrix"
+  )
+test_cm_plot
+```
+
+```{r Variable importance}
+p.variable.importance <- test_results %>% 
+  pluck(".workflow", 1) %>%   
+  extract_fit_parsnip() %>% 
+  vip(num_features = 20)
+p.variable.importance
+```
+
+```{r Predict on new data}
+#Import new data
+new_data <- read.csv("Data/new_data.csv")
+new_data %>% glimpse()
+
+#Create text column
+new_data <- new_data %>%
+  mutate(text = paste(Immediate.cause, Other.conditions))
+
+#Extract fitted model to predict on new data
+test_fitted <- test_results$.workflow[[1]]
+
+#Predict the class on new data
+predict(test_fitted, new_data = new_data, type = "class")
+
+#Predict the probability of classes on new data
+predict(test_fitted, new_data = new_data, type = "prob")
+
+new_data_predicted <- bind_cols(new_data,
+    predict(test_fitted, new_data = new_data, type = "class"),
+    predict(test_fitted, new_data = new_data, type = "prob")) 
+View(new_data_predicted)
+```
+
+```{r}
+#Covert text to upper
+new_data <- new_data %>%
+  mutate(text2 = text, 
+         text = toupper(text))
+
+#Extract fitted model to predict on new data
+test_fitted <- test_results$.workflow[[1]]
+
+#Predict the class on new data
+predict(test_fitted, new_data = new_data, type = "class")
+
+#Predict the probability of classes on new data
+predict(test_fitted, new_data = new_data, type = "prob")
+
+new_data_predicted <- bind_cols(new_data,
+    predict(test_fitted, new_data = new_data, type = "class"),
+    predict(test_fitted, new_data = new_data, type = "prob")) 
+View(new_data_predicted)
+```
+
+```{r Large language models}
+# Set up a large language model
+chat_openai <- create_chat('openai', Sys.getenv('OAI_DEV_KEY'))
+
+chat_openai %>%
+  add_model('gpt-3.5-turbo') %>%
+  add_params(temperature = 0.5, max_tokens = 100) %>%
+  add_message(
+    role = 'system',
+    message = 'You are a chatbot that completes texts.
+    You do not return the full text.
+    Just what you think completes the text.'
+  ) %>%
+  add_message(
+    # default role = 'user'
+    '2 + 2 is 4, minus 1 that\'s 3, '
+  ) 
+
+chat_openai <- chat_openai %>% perform_chat()
+chat_openai %>% extract_chat()
+
+#Mistral example
+mistral_chat <- create_chat('mistral', Sys.getenv('MISTRAL_DEV_KEY')) %>%
+  add_model('mistral-large-latest') %>%
+  add_params(temperature = 0.5, max_tokens = 100) %>%
+  add_message(
+    role = 'system',
+    message = 'You are a chatbot that completes texts.
+    You do not return the full text.
+    Just what you think completes the text.'
+  ) %>% 
+  add_message(
+    # default role = 'user'
+    '2 + 2 is 4, minus 1 that\'s 3, '
+  ) %>% 
+  perform_chat()
+mistral_chat %>% extract_chat(silent = F)
+
+```
+
+```{r}
+#Set up prompt
+systemmsg <- "Please classify the following medical examiner data based on the presence of specific keywords. The data should be categorized into one or more of the following classifications:
+
+Alcohol: Keywords include 'Alcohol', 'ethanol', 'ethanolism'.
+Amphetamine: Keywords include 'Amphetamine' (only instances where amphetamine is mentioned without methamphetamine should be counted in this category).
+Anticonvulsants: Keywords include 'Carbamazepine', 'clobazam', 'oxcarbazepine', 'diazepam', 'ethosuxamide', 'phenytoin', 'gabapentin', 'lacosamide', 'levetiracetam', 'phenobarbital', 'pregabalin', 'lamotrigine', 'topiramate', 'valproate', 'valproic acid', 'zonisamide'.
+Anti-depressants: Keywords include 'Citalopram', 'fluoxetine', 'fluvoxamine', 'paroxetine', 'sertraline', 'buproprion', 'venlafaxine', 'duloxetine', 'desvenlafasxine', 'levomilnacipran', 'imipramine', 'desipramine', 'nortriptyline', 'doxepin', 'trimipramine', 'amoxapine', 'protriptyline', 'trazodone', 'mirtazapine'.
+Antihistamines: Keywords include 'Diphenydramine', 'cetirizine', 'chlorpheniramine', 'fexofenadine', 'loratadine', 'hydroxyzine', 'doxylamine', 'xylazine'.
+Anti-psychotics: Keywords include 'Risperidone', 'quetiapine', 'olanzapine', 'aripiprazole', 'clozapine', 'haloperidol', 'chlorpromazine', 'ziprasidone', 'paliperidone', 'trifluoperazine', 'perphenazine', 'fluphenazine', 'lurasidone', 'pimozide'.
+Barbiturates: Keywords include 'Butalbital', 'phenobarbital', 'pentobarbital', 'butabarbital', 'amobarbital'.
+Benzodiazepines: Keywords include 'Benzodiazapene', 'etizolam', 'chlordiazepoxide', 'lorazepam', 'flubromazolam', 'nordiazepam', 'diazepam', 'pyrazolam', 'clonazepam', 'estazolam', 'xanax', 'alprazolam', 'flualprazolam'.
+Cocaine: Keywords include 'Cocaine', 'cocaethylene'.
+Fentanyl: Keywords include 'Fentanyl', '4-ANPP', 'carfentanil', 'acetylfentanyl'.
+Hallucinogens: Keywords include 'Phencycldine', 'LSD', 'diethylamide', 'ketamine', 'PCP', 'methylenedioxyamphetamine'.
+Heroin: Keywords include 'Heroin'.
+MDMA: Keywords include '3,4-methylenedioxymethamphetamine', 'MDMA', 'methylenedioxymethamphetamine', '3,4-methylenedioxymethaphetamine'.
+MDA: Keywords include 'Methylenedioxyamphetamine', 'methylenedioxyamphetamine', 'MDA'.
+Methamphetamine: Keywords include 'Methamphetamine'.
+Muscle relaxants: Keywords include 'Cyclobenzaprine', 'baclofen', 'carisoprodol', 'metaxalone', 'methocarbamol', 'tizanidine', 'orphenadrine'.
+Prescription opioids: Keywords include 'Hydrocodone', 'oxycodone', 'hydromorphone', 'oxymorphone', 'codeine', 'oxycontin', 'methadone', 'percocet', 'buprenorphine', 'meperidine', 'morphine', 'tapentadol', 'tramadol', 'naltrexone', 'levorphanol'.
+Only provide True or False for each category, no explanation.
+Please provide the classification(s) for the following data:
+      "
+
+#Example with a single row
+mistral_chat <- create_chat('mistral', Sys.getenv('MISTRAL_DEV_KEY')) %>%
+  add_model('mistral-large-latest') %>%
+  add_params(temperature = 0.5, max_tokens = 100) %>%
+  add_message(
+    role = 'system',
+    message = systemmsg
+  ) %>% 
+  add_message(
+    # default role = 'user'
+    df$text[7]
+  ) %>% 
+  perform_chat()
+mistral_chat %>% extract_chat(silent = F)
+
+#Example with a single row and create dataframe
+mistral_chat <- create_chat('mistral', Sys.getenv('MISTRAL_DEV_KEY')) %>%
+  add_model('mistral-large-latest') %>%
+  add_params(temperature = 0.5, max_tokens = 200) %>%
+  add_message(
+    role = 'system',
+    message = systemmsg
+  ) %>% 
+  add_message(
+    # default role = 'user'
+    df$text[7]
+  ) %>% 
+  perform_chat() %>% 
+  extract_chat(silent = T)
+
+#Set up map to run through a dataframe
+tmp <- map_dfr(df$text[15:20], ~ {
+mistral_chat <- create_chat('mistral', Sys.getenv('MISTRAL_DEV_KEY')) %>%
+  add_model('mistral-large-latest') %>%
+  add_params(temperature = 0.5, max_tokens = 200) %>%
+  add_message(
+    role = 'system',
+    message = systemmsg
+  ) %>% 
+  add_message(
+    # default role = 'user'
+    .x
+  ) %>% 
+  perform_chat() %>% 
+  extract_chat(silent = T) %>%
+  filter(role == "assistant") %>%
+  rename(annotation = message) %>%
+  #Create columns
+  mutate(
+    alcohol = str_extract(annotation, "(?i)Alcohol:\\s*\\**(True|False)\\**"),
+    amphetamine = str_extract(annotation, "(?i)Amphetamine:\\s*\\**(True|False)\\**"),
+    anticonvulsants = str_extract(annotation, "(?i)Anticonvulsants:\\s*\\**(True|False)\\**"),
+    anti_depressants = str_extract(annotation, "(?i)Anti-depressants:\\s*\\**(True|False)\\**"),
+    antihistamines = str_extract(annotation, "(?i)Antihistamines:\\s*\\**(True|False)\\**"),
+    anti_psychotics = str_extract(annotation, "(?i)Anti-psychotics:\\s*\\**(True|False)\\**"),
+    barbiturates = str_extract(annotation, "(?i)Barbiturates:\\s*\\**(True|False)\\**"),
+    benzodiazepines = str_extract(annotation, "(?i)Benzodiazepines:\\s*\\**(True|False)\\**"),
+    cocaine = str_extract(annotation, "(?i)Cocaine:\\s*\\**(True|False)\\**"),
+    fentanyl = str_extract(annotation, "(?i)Fentanyl:\\s*\\**(True|False)\\**"),
+    hallucinogens = str_extract(annotation, "(?i)Hallucinogens:\\s*\\**(True|False)\\**"),
+    heroin = str_extract(annotation, "(?i)Heroin:\\s*\\**(True|False)\\**"),
+    MDMA = str_extract(annotation, "(?i)MDMA:\\s*\\**(True|False)\\**"),
+    MDA = str_extract(annotation, "(?i)MDA:\\s*\\**(True|False)\\**"),
+    methamphetamine = str_extract(annotation, "(?i)Methamphetamine:\\s*\\**(True|False)\\**"),
+    muscle_relaxants = str_extract(annotation, "(?i)Muscle relaxants:\\s*\\**(True|False)\\**"),
+    prescription_opioids = str_extract(annotation, "(?i)Prescription opioids:\\s*\\**(True|False)\\**"),
+    cannabis = str_extract(annotation, "(?i)Cannabis:\\s*\\**(True|False)\\**"),
+    injection_drug_use = str_extract(annotation, "(?i)Injection drug use:\\s*\\**(True|False)\\**"),
+    general_drugs = str_extract(annotation, "(?i)General Drugs:\\s*\\**(True|False)\\**")
+  ) %>%
+  # Remove text and keep only "True" or "False"
+  mutate(across(alcohol:general_drugs, ~ str_remove_all(.x, "(?i)Alcohol:\\s*|Amphetamine:\\s*|Anticonvulsants:\\s*|Anti-depressants:\\s*|Antihistamines:\\s*|Anti-psychotics:\\s*|Barbiturates:\\s*|Benzodiazepines:\\s*|Cocaine:\\s*|Fentanyl:\\s*|Hallucinogens:\\s*|Heroin:\\s*|MDMA:\\s*|MDA:\\s*|Methamphetamine:\\s*|Muscle relaxants:\\s*|Prescription opioids:\\s*|Cannabis:\\s*|Injection drug use:\\s*|General Drugs:\\s*|\\**"))) %>%
+  # Convert values to logical (TRUE/FALSE)
+  mutate(across(alcohol:general_drugs, ~ .x == "True"))
+})
+
+```
+
+```{r Keyword matching}
+# Define the keywords for each category
+keywords <- list(
+  alcohol = c("Alcohol", "ethanol", "ethanolism"),
+  amphetamine = c("Amphetamine"),
+  anticonvulsants = c("Carbamazepine", "clobazam", "oxcarbazepine", "diazepam", "ethosuxamide", "phenytoin", "gabapentin", "lacosamide", "levetiracetam", "phenobarbital", "pregabalin", "lamotrigine", "topiramate", "valproate", "valproic acid", "zonisamide"),
+  anti_depressants = c("Citalopram", "fluoxetine", "fluvoxamine", "paroxetine", "sertraline", "buproprion", "venlafaxine", "duloxetine", "desvenlafasxine", "levomilnacipran", "imipramine", "desipramine", "nortriptyline", "doxepin", "trimipramine", "amoxapine", "protriptyline", "trazodone", "mirtazapine"),
+  antihistamines = c("Diphenydramine", "cetirizine", "chlorpheniramine", "fexofenadine", "loratadine", "hydroxyzine", "doxylamine", "xylazine"),
+  anti_psychotics = c("Risperidone", "quetiapine", "olanzapine", "aripiprazole", "clozapine", "haloperidol", "chlorpromazine", "ziprasidone", "paliperidone", "trifluoperazine", "perphenazine", "fluphenazine", "lurasidone", "pimozide"),
+  barbiturates = c("Butalbital", "phenobarbital", "pentobarbital", "butabarbital", "amobarbital"),
+  benzodiazepines = c("Benzodiazapene", "etizolam", "chlordiazepoxide", "lorazepam", "flubromazolam", "nordiazepam", "diazepam", "pyrazolam", "clonazepam", "estazolam", "xanax", "alprazolam", "flualprazolam"),
+  cocaine = c("Cocaine", "cocaethylene"),
+  fentanyl = c("Fentanyl", "4-ANPP", "carfentanil", "acetylfentanyl"),
+  hallucinogens = c("Phencycldine", "LSD", "diethylamide", "ketamine", "PCP", "methylenedioxyamphetamine"),
+  heroin = c("Heroin"),
+  MDMA = c("3,4-methylenedioxymethamphetamine", "MDMA", "methylenedioxymethamphetamine", "3,4-methylenedioxymethaphetamine"),
+  MDA = c("Methylenedioxyamphetamine", "methylenedioxyamphetamine", "MDA"),
+  methamphetamine = c("Methamphetamine"),
+  muscle_relaxants = c("Cyclobenzaprine", "baclofen", "carisoprodol", "metaxalone", "methocarbamol", "tizanidine", "orphenadrine"),
+  prescription_opioids = c("Hydrocodone", "oxycodone", "hydromorphone", "oxymorphone", "codeine", "oxycontin", "methadone", "percocet", "buprenorphine", "meperidine", "morphine", "tapentadol", "tramadol", "naltrexone", "levorphanol")
+)
+
+# Function to check for keywords in text
+check_keywords <- function(text, keywords) {
+  any(map_lgl(keywords, ~ str_detect(text, fixed(.x, ignore_case = TRUE))))
+}
+
+# Apply the function to the data frame using map
+df <- df %>%
+  mutate(
+    alcohol = map_lgl(text, ~ check_keywords(.x, keywords$alcohol)),
+    amphetamine = map_lgl(text, ~ check_keywords(.x, keywords$amphetamine)),
+    anticonvulsants = map_lgl(text, ~ check_keywords(.x, keywords$anticonvulsants)),
+    anti_depressants = map_lgl(text, ~ check_keywords(.x, keywords$anti_depressants)),
+    antihistamines = map_lgl(text, ~ check_keywords(.x, keywords$antihistamines)),
+    anti_psychotics = map_lgl(text, ~ check_keywords(.x, keywords$anti_psychotics)),
+    barbiturates = map_lgl(text, ~ check_keywords(.x, keywords$barbiturates)),
+    benzodiazepines = map_lgl(text, ~ check_keywords(.x, keywords$benzodiazepines)),
+    cocaine = map_lgl(text, ~ check_keywords(.x, keywords$cocaine)),
+    fentanyl = map_lgl(text, ~ check_keywords(.x, keywords$fentanyl)),
+    hallucinogens = map_lgl(text, ~ check_keywords(.x, keywords$hallucinogens)),
+    heroin = map_lgl(text, ~ check_keywords(.x, keywords$heroin)),
+    MDMA = map_lgl(text, ~ check_keywords(.x, keywords$MDMA)),
+    MDA = map_lgl(text, ~ check_keywords(.x, keywords$MDA)),
+    methamphetamine = map_lgl(text, ~ check_keywords(.x, keywords$methamphetamine)),
+    muscle_relaxants = map_lgl(text, ~ check_keywords(.x, keywords$muscle_relaxants)),
+    prescription_opioids = map_lgl(text, ~ check_keywords(.x, keywords$prescription_opioids))
+  )
+
+
+```
